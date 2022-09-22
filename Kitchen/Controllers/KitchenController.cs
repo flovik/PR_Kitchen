@@ -3,6 +3,7 @@ using Kitchen.Models;
 using Kitchen.Services;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Newtonsoft.Json;
 
 namespace Kitchen.Controllers
 {
@@ -19,22 +20,19 @@ namespace Kitchen.Controllers
         }
 
         [HttpPost("order")]
-        public async Task<IActionResult> Order([FromBody] Order order)
+        public IActionResult Order([FromBody] Order order)
         {
             //endpoint for kitchen server, here comes returnOrder
-            _logger.Log(LogLevel.Information, 1000, $"Dining Hall sent order with ID {order.OrderId} " +
-                                                    $"from table {order.TableId}");
+            _logger.LogWarning($"Dining Hall sent order with ID {order.OrderId} " +
+                                                    $"from table {order.TableId} " +
+                                                    $"by waiter {order.WaiterId}");
 
-            await _kitchenService.ReceiveOrder(order);
+            _logger.LogWarning(JsonConvert.SerializeObject(order));
+
+            //add order in _orderQueue
+            Task.Run(() =>  _kitchenService.AddToOrder(order));
 
             return NoContent();
-        }
-
-        [HttpGet("get")]
-        public async Task<IActionResult> Get()
-        {
-
-            return Ok("heell");
         }
     }
 }

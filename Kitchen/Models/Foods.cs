@@ -1,9 +1,9 @@
 ﻿namespace Kitchen.Models
 {
-    public class Foods
+    public static class Foods
     {
         //id-to-food dictionary
-        public readonly IDictionary<int, Food> foods = new Dictionary<int, Food>()
+        public static readonly IDictionary<int, Food> foods = new Dictionary<int, Food>()
         {
             {1, new Food()
             {

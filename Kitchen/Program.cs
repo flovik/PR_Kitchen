@@ -3,7 +3,8 @@ using Kitchen.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddScoped<IKitchenService, KitchenService>();
+builder.Services.AddSingleton<IKitchenSender, KitchenSender>();
+builder.Services.AddSingleton<IKitchenService, KitchenService>();
 
 builder.Services.AddControllers();
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
