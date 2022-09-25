@@ -4,12 +4,12 @@ namespace Kitchen.Services
 {
     public class Cook
     {
-        public int CookId { get; set; }
-        public int Rank { get; set; }
-        public int Proficiency { get; set; }
-        public int CanCook { get; set; }
-        public string Name { get; set; }
-        public string CatchPhrase { get; set; }
+        public int CookId { get; }
+        public int Rank { get; }
+        public int Proficiency { get; }
+        public string Name { get; }
+        public string CatchPhrase { get; }
+        public int TimeUnit { get; set; }
 
         public Cook(int cookId, int proficiency, string name, string catchPhrase, int rank)
         {
@@ -18,15 +18,12 @@ namespace Kitchen.Services
             Name = name;
             CatchPhrase = catchPhrase;
             Rank = rank;
-            CanCook = proficiency;
         }
 
         public CookingDetails PrepFood(Food food)
         {
-            //TODO logic of preparing food
-            Thread.Sleep(food.PreparationTime * 1000);
+            Thread.Sleep(food.PreparationTime * TimeUnit);
 
-            //CanCook++;
             return new CookingDetails
             {
                 CookId = CookId,
