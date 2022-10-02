@@ -14,18 +14,23 @@ namespace Kitchen.Services
         public int Proficiency { get; private set; }
         public Mutex PreparingOrdersMutex { get; set; }
         public ConcurrentDictionary<int, ReturnOrder> PreparingOrders { get; set; }
+        public ILogger<Cook> _logger { get; set; }
 
         public Cook(int cookId, int proficiency, string name, string catchPhrase, int rank)
         {
             CookId = cookId;
             Proficiency = proficiency;
-            ProficiencyThreads = new List<Thread>(proficiency);
+            ProficiencyThreads = new List<Thread>();
+            for (int i = 0; i < proficiency; i++)
+            {
+                ProficiencyThreads.Add(new Thread(() => {}));
+            }
             Name = name;
             CatchPhrase = catchPhrase;
             Rank = rank;
         }
 
-        public void Prep((int, Food) food)
+        public Task Prep((int, Food) food)
         {
             //take any thread that is not alive (meaning waiting to prepare something)
             for (int i = 0; i < ProficiencyThreads.Count; i++)
@@ -34,9 +39,16 @@ namespace Kitchen.Services
 
                 //thread is used, lower proficiency
                 Proficiency--;
-                ProficiencyThreads[i] = new Thread(() => PrepFood(food));
+                ProficiencyThreads[i] = new Thread(() => PrepFood(food))
+                {
+                    Name = $"{CookId} | {i}"
+                };
+
                 ProficiencyThreads[i].Start();
+                break;
             }
+
+            return Task.CompletedTask;
         }
 
         public void PrepFood((int, Food) food)
@@ -52,13 +64,16 @@ namespace Kitchen.Services
             });
             PreparingOrdersMutex.ReleaseMutex();
 
+            _logger.LogWarning($"Cook {Name} made food {food.Item2.Id} from order {food.Item1}");
+
             //thread is released, higher proficiency
             Proficiency++;
         }
 
         public bool CanCook(int complexity)
         {
-            return Rank >= complexity && Proficiency != 0;
+            if (Rank < complexity || Proficiency == 0) return false;
+            return true;
         }
     }
 }

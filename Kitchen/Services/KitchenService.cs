@@ -13,16 +13,18 @@ namespace Kitchen.Services
         private readonly ConcurrentDictionary<int, ReturnOrder> _preparingOrders = new(); //orders that are currently prepared, find order by its ID
         private readonly ILogger<KitchenService> _logger;
         private readonly List<Cook> _cooks = new();
+        private readonly List<Stove> _stoves = new();
+        private readonly List<Oven> _ovens = new();
         private readonly ConcurrentDictionary<int, ConcurrentQueue<(int, Food)>> _foodList; //dictionary that saves foods based on their complexity in queues
         private static readonly Mutex OrderListMutex = new();
         private static readonly Mutex PreparingOrdersMutex = new();
         private readonly IKitchenSender _kitchenSender;
         private readonly SemaphoreSlim _foodListSemaphore;
-        private readonly SemaphoreSlim _stovesSemaphore;
-        private readonly SemaphoreSlim _ovensSemaphore;
+        //private readonly SemaphoreSlim _stovesSemaphore;
+        //private readonly SemaphoreSlim _ovensSemaphore;
         public int TimeUnit { get; }
 
-        public KitchenService(IConfiguration configuration, ILogger<KitchenService> logger, IKitchenSender kitchenSender)
+        public KitchenService(IConfiguration configuration, ILogger<KitchenService> logger, IKitchenSender kitchenSender, ILogger<Cook> cookLogger, ILogger<Stove> stoveLogger, ILogger<Oven> ovenLogger)
         {
             _logger = logger;
             _kitchenSender = kitchenSender;
@@ -34,16 +36,16 @@ namespace Kitchen.Services
                 [1] = new(), //complexity 1
                 [2] = new(), //complexity 2 
                 [3] = new(), //complexity 3
-                //[4] = new(), //stoves row
-                //[5] = new() //ovens row
+                [4] = new(), //stoves row
+                [5] = new() //ovens row
             };
 
             //init time unit
             TimeUnit = configuration.GetValue<int>("TIME_UNIT");
 
             //init stoves and ovens
-            //var stoves = configuration.GetValue<int>("Stoves");
-            //var ovens = configuration.GetValue<int>("Ovens");
+            var stoves = configuration.GetValue<int>("Stoves");
+            var ovens = configuration.GetValue<int>("Ovens");
             //_stovesSemaphore = new SemaphoreSlim(stoves, stoves);
             //_ovensSemaphore = new SemaphoreSlim(ovens, ovens);
 
@@ -57,7 +59,26 @@ namespace Kitchen.Services
                 cook.TimeUnit = TimeUnit;
                 cook.PreparingOrdersMutex = PreparingOrdersMutex;
                 cook.PreparingOrders = _preparingOrders;
+                cook._logger = cookLogger;
                 _cooks.Add(cook);
+            }
+
+            for (int i = 0; i < stoves; i++)
+            {
+                var stove = new Stove(TimeUnit);
+                stove.PreparingOrdersMutex = PreparingOrdersMutex;
+                stove.PreparingOrders = _preparingOrders;
+                stove._logger = stoveLogger;
+                _stoves.Add(stove);
+            }
+
+            for (int i = 0; i < ovens; i++)
+            {
+                var oven = new Oven(TimeUnit);
+                oven.PreparingOrdersMutex = PreparingOrdersMutex;
+                oven.PreparingOrders = _preparingOrders;
+                oven._logger = ovenLogger;
+                _ovens.Add(oven);
             }
 
             //sort cooks by rank, lowest rank cook will take lowest ranking foods first
@@ -67,10 +88,10 @@ namespace Kitchen.Services
             _foodListSemaphore = new SemaphoreSlim(2, 2);
 
             //start threading with cooks
-            Start();
+            Task.Run(Start);
         }
 
-        public void Start()
+        public async void Start()
         {
             while (true)
             {
@@ -87,12 +108,12 @@ namespace Kitchen.Services
                     foreach (var cook in _cooks)
                     {
                         //if cook cannot cook that food, skip him
-                        if(cook.CanCook(complexity)) continue;
+                        if(!cook.CanCook(complexity)) continue;
 
                         //if no foods, don't cook
                         if (_foodList[complexity].IsEmpty) continue;
 
-                        _foodListSemaphore.Wait();
+                        await _foodListSemaphore.WaitAsync(); // wait 
                         //remove food from foodList
                         var isAnyFood = _foodList[complexity].TryDequeue(out var food);
                         _foodListSemaphore.Release();
@@ -102,7 +123,7 @@ namespace Kitchen.Services
                         _logger.LogWarning($"Food {food.Item2.Id} from order {food.Item1} " +
                                            $"is being prepared by cook {cook.Name}");
 
-                        cook.Prep(food);
+                        await cook.Prep(food);
                     }
                 }
 
@@ -146,13 +167,16 @@ namespace Kitchen.Services
         public void CheckIfReady()
         {
             //for every preparing order check if it is ready to dispatch
+            if (_preparingOrders.IsEmpty) return;
+            PreparingOrdersMutex.WaitOne();
             foreach (var (orderId, returnOrder) in _preparingOrders.ToList())
             {
                 //check number of cooking details with the total number of items in the original order
                 if (returnOrder.CookingDetails.Count == _orderList[orderId].Items.Count)
                 {
                     //time when last cooking details were added - pickup time of order
-                    returnOrder.CookingTime = (int) (((DateTimeOffset)DateTime.Now).ToUnixTimeSeconds() - _preparingOrders[orderId].PickUpTime);
+                    returnOrder.CookingTime = (int)(((DateTimeOffset)DateTime.Now).ToUnixTimeSeconds() -
+                                                    _preparingOrders[orderId].PickUpTime);
                     _logger.LogWarning($"Order {returnOrder.OrderId} is ready to be returned back");
 
                     OrderListMutex.WaitOne();
@@ -164,20 +188,18 @@ namespace Kitchen.Services
                     _logger.LogWarning($"Order {returnOrder.OrderId} is dispatched to Dining Hall!");
                     _kitchenSender.SendReturnOrder(returnOrder);
 
-                    PreparingOrdersMutex.WaitOne();
                     //delete returnOrder from _preparingOrders
                     _preparingOrders.TryRemove(new KeyValuePair<int, ReturnOrder>(orderId, returnOrder));
-                    PreparingOrdersMutex.ReleaseMutex();
                 }
             }
-
+            PreparingOrdersMutex.ReleaseMutex();
         }
 
         public void AddToOrder(Order order)
         {
             OrderListMutex.WaitOne();
             _orderList[order.OrderId] = order;
-            OrderListMutex.WaitOne();
+            OrderListMutex.ReleaseMutex();
             _logger.LogWarning($"Order {order.OrderId} has been added to the Order List!");
             BreakDownOrderToFoodList(order); 
         }
@@ -201,12 +223,12 @@ namespace Kitchen.Services
                 //add stoves/oven
                 switch (food.CookingApparatus)
                 {
-                    //case CookingApparatus.Stove:
-                    //    _foodList[4].Enqueue((order.OrderId, food));
-                    //    break;
-                    //case CookingApparatus.Oven:
-                    //    _foodList[5].Enqueue((order.OrderId, food));
-                    //    break;
+                    case CookingApparatus.Stove:
+                        _foodList[4].Enqueue((order.OrderId, food));
+                        break;
+                    case CookingApparatus.Oven:
+                        _foodList[5].Enqueue((order.OrderId, food));
+                        break;
                     default:
                         //add in foodList based on complexity food and its order id
                         _foodList[food.Complexity].Enqueue((order.OrderId, food));
@@ -216,8 +238,6 @@ namespace Kitchen.Services
                 
             }
             _foodListSemaphore.Release();
-
-            _logger.LogCritical($"{_preparingOrders.Count}");
         }
     }
 }
