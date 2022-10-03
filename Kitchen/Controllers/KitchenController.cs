@@ -30,7 +30,7 @@ namespace Kitchen.Controllers
             _logger.LogWarning(JsonConvert.SerializeObject(order));
 
             //add order in _orderQueue
-            Task.Run(() =>  _kitchenService.AddToOrder(order));
+            _kitchenService.AddToOrder(order);
 
             return NoContent();
         }

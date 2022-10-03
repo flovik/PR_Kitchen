@@ -1,6 +1,7 @@
 ﻿using System.Collections.Concurrent;
 using Kitchen.Interfaces;
 using Kitchen.Models;
+using Kitchen.Util;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 
@@ -11,17 +12,17 @@ namespace Kitchen.Services
         private readonly ConcurrentDictionary<int, Order> _orderList; //list of orders
         private readonly ConcurrentDictionary<int, ReturnOrder> _preparingOrders = new(); //orders that are currently prepared, find order by its ID
         private readonly ILogger<KitchenService> _logger;
-        private readonly BlockingCollection<Cook> _cooks = new();
+        private readonly List<Cook> _cooks = new();
+        private readonly List<Stove> _stoves = new();
+        private readonly List<Oven> _ovens = new();
         private readonly ConcurrentDictionary<int, ConcurrentQueue<(int, Food)>> _foodList; //dictionary that saves foods based on their complexity in queues
         private static readonly Mutex OrderListMutex = new();
         private static readonly Mutex PreparingOrdersMutex = new();
         private readonly IKitchenSender _kitchenSender;
         private readonly SemaphoreSlim _foodListSemaphore;
-        private readonly SemaphoreSlim _stovesSemaphore;
-        private readonly SemaphoreSlim _ovensSemaphore;
         public int TimeUnit { get; }
 
-        public KitchenService(IConfiguration configuration, ILogger<KitchenService> logger, IKitchenSender kitchenSender)
+        public KitchenService(IConfiguration configuration, ILogger<KitchenService> logger, IKitchenSender kitchenSender, ILogger<Cook> cookLogger, ILogger<Stove> stoveLogger, ILogger<Oven> ovenLogger)
         {
             _logger = logger;
             _kitchenSender = kitchenSender;
@@ -43,129 +44,152 @@ namespace Kitchen.Services
             //init stoves and ovens
             var stoves = configuration.GetValue<int>("Stoves");
             var ovens = configuration.GetValue<int>("Ovens");
-            _stovesSemaphore = new SemaphoreSlim(stoves, stoves);
-            _ovensSemaphore = new SemaphoreSlim(ovens, ovens);
+            //_stovesSemaphore = new SemaphoreSlim(stoves, stoves);
+            //_ovensSemaphore = new SemaphoreSlim(ovens, ovens);
 
             //initialize cooks
             var cooks = configuration.GetValue<int>("Cooks");
 
             for (int i = 0; i < cooks; i++)
             {
-                //for each proficiency of a cook, add an instance of that cook that can prepare a specific food
+                //create cook array
                 var cook = Cooks.cooks[i + 1];
-                for (int j = 0; j < cook.Proficiency; j++)
-                {
-                    _cooks.Add(cook);
-                }
+                cook.TimeUnit = TimeUnit;
+                cook.PreparingOrdersMutex = PreparingOrdersMutex;
+                cook.PreparingOrders = _preparingOrders;
+                cook._logger = cookLogger;
+                _cooks.Add(cook);
             }
+
+            for (int i = 0; i < stoves; i++)
+            {
+                var stove = new Stove(i + 1, TimeUnit)
+                {
+                    PreparingOrdersMutex = PreparingOrdersMutex,
+                    PreparingOrders = _preparingOrders,
+                    _logger = stoveLogger
+                };
+                _stoves.Add(stove);
+            }
+
+            for (int i = 0; i < ovens; i++)
+            {
+                var oven = new Oven(i + 1, TimeUnit)
+                {
+                    PreparingOrdersMutex = PreparingOrdersMutex,
+                    PreparingOrders = _preparingOrders,
+                    _logger = ovenLogger
+                };
+                _ovens.Add(oven);
+            }
+
+            //sort cooks by rank, lowest rank cook will take lowest ranking foods first
+            _cooks.Sort(new CooksRankComparer());
 
             //grant access to food for every instance of cook, all cooks + one thread that adds the food, stoves and ovens
-            _foodListSemaphore = new SemaphoreSlim(_cooks.Count + stoves + ovens + 1, _cooks.Count + stoves + ovens + 1);
+            _foodListSemaphore = new SemaphoreSlim(2, 2);
 
             //start threading with cooks
-            foreach (var cook in _cooks)
-            {
-                //set the time unit for each waiter before he begins working
-                cook.TimeUnit = TimeUnit;
-                Task.Run(() => Start(cook));
-            }
+            Task.Run(Start);
         }
 
-        public void Start(Cook cook)
+        public async void Start()
         {
             while (true)
             {
                 //cooking apparatus will execute here, because it is not considered food that occupies a whole thread
                 //a specific waiter can take the food and put in the stove
 
-                //run new task here
-                CheckApparatusFood(cook, 4); //for stoves
-                CheckApparatusFood(cook, 5); //for ovens
+                foreach (var cook in _cooks)
+                {
+                    if (!_foodList[4].IsEmpty) //stoves
+                    {
+                        _foodList[4].TryPeek(out var food);
+                        if (!cook.CanCook(food.Item2.Complexity)) continue;
 
-                _foodListSemaphore.Wait();
+                        foreach (var stove in _stoves)
+                        {
+                            if (stove.State == ApparatusState.Free)
+                            {
+                                await _foodListSemaphore.WaitAsync(); // wait 
+                                //remove food from foodList
+                                _foodList[4].TryDequeue(out var cookFood);
+                                _foodListSemaphore.Release();
+
+                                stove.State = ApparatusState.Occupied;
+                                await cook.UseStove(stove, cookFood);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!_foodList[5].IsEmpty) //ovens
+                    {
+                        _foodList[5].TryPeek(out var food);
+                        if (!cook.CanCook(food.Item2.Complexity)) continue;
+
+                        foreach (var oven in _ovens)
+                        {
+                            if (oven.State == ApparatusState.Free)
+                            {
+                                await _foodListSemaphore.WaitAsync(); // wait 
+                                //remove food from foodList
+                                _foodList[5].TryDequeue(out var cookFood);
+                                _foodListSemaphore.Release();
+
+                                oven.State = ApparatusState.Occupied;
+                                await cook.UseOven(oven, cookFood);
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 //iterate every foodQueue (from 1 to 3) the cook can cook from highest to lowest
                 for (int complexity = 3; complexity >= 1; complexity--)
                 {
-                    //if cook cannot cook that food, skip it
-                    if (cook.Rank < complexity) continue;
-
-                    //if no foods, don't cook
-                    if (_foodList[complexity].IsEmpty) continue;
-
-                    //remove food from foodList
-                    var isAnyFood = _foodList[complexity].TryDequeue(out var result);
-
-                    if(!isAnyFood) break;
-
-                    PrepareFood(cook, result);
-                }
-
-                _foodListSemaphore.Release();
-            }
-        }
-
-        public void CheckApparatusFood(Cook cook, int row)
-        {
-            _foodListSemaphore.Wait();
-            if (!_foodList[row].IsEmpty) //no cooking apparatus foods
-            {
-                var isFood = _foodList[row].TryDequeue(out var food);
-                if (isFood && cook.Rank >= food.Item2.Complexity) //check if could get stove food and that current cook's complexity is enough
-                {
-                    switch (row)
+                    foreach (var cook in _cooks)
                     {
-                        case 4:
-                            _stovesSemaphore.Wait();
-                            _logger.LogCritical($"A stove is used! Remaining: {_stovesSemaphore.CurrentCount}");
-                            Task.Run(() => PrepareFood(cook, food)).Wait(); //new thread for preparing food in stove, wait for it when done
-                            //then release it for another food to be cooked
-                            _stovesSemaphore.Release();
-                            _logger.LogCritical($"A stove is released! Remaining: {_stovesSemaphore.CurrentCount}");
-                            break;
-                        case 5:
-                            _ovensSemaphore.Wait();
-                            _logger.LogCritical($"An oven is used! Remaining: {_ovensSemaphore.CurrentCount}");
-                            Task.Run(() => PrepareFood(cook, food)).Wait();
-                            _ovensSemaphore.Release();
-                            _logger.LogCritical($"An oven is released! Remaining: {_ovensSemaphore.CurrentCount}");
-                            break;
+                        //if cook cannot cook that food, skip him
+                        if(!cook.CanCook(complexity)) continue;
+
+                        //if no foods, don't cook
+                        if (_foodList[complexity].IsEmpty) continue;
+
+                        await _foodListSemaphore.WaitAsync(); // wait 
+                        //remove food from foodList
+                        var isAnyFood = _foodList[complexity].TryDequeue(out var food);
+                        _foodListSemaphore.Release();
+
+                        if (!isAnyFood) break;
+
+                        _logger.LogWarning($"Food {food.Item2.Id} from order {food.Item1} " +
+                                           $"is being prepared by cook {cook.Name}");
+
+                        await cook.Prep(food);
                     }
-                    
                 }
+
+                //after a full cycle of going thru foodList, check if we have any prepped food
+                CheckIfReady();
             }
-            _foodListSemaphore.Release();
-        }
-
-        public void PrepareFood(Cook cook, (int, Food) food)
-        {
-            _logger.LogWarning($"Food {food.Item2.Id} from order {food.Item1} " +
-                               $"is being prepared by cook {cook.Name}");
-
-            var cookingDetails = Task.Run(() => cook.PrepFood(food.Item2)).Result;
-
-            PreparingOrdersMutex.WaitOne();
-            //add in preparing orders the cooking details
-            _preparingOrders[food.Item1].CookingDetails.Add(cookingDetails);
-            _logger.LogWarning($"New cooking details have been added to order {food.Item1} by {cook.Name}");
-            PreparingOrdersMutex.ReleaseMutex();
-
-            //call function after adding cooking details
-            //checks if returnOrder is ready to be dispatched
-            CheckIfReady();
         }
 
         public void CheckIfReady()
         {
-            PreparingOrdersMutex.WaitOne();
             //for every preparing order check if it is ready to dispatch
+            if (_preparingOrders.IsEmpty) return;
+            PreparingOrdersMutex.WaitOne();
             foreach (var (orderId, returnOrder) in _preparingOrders.ToList())
             {
                 //check number of cooking details with the total number of items in the original order
                 if (returnOrder.CookingDetails.Count == _orderList[orderId].Items.Count)
                 {
                     //time when last cooking details were added - pickup time of order
-                    returnOrder.CookingTime = (int) (((DateTimeOffset)DateTime.Now).ToUnixTimeSeconds() - _preparingOrders[orderId].PickUpTime);
+                    returnOrder.CookingTime = (int)(((DateTimeOffset)DateTime.Now).ToUnixTimeSeconds() -
+                                                    _preparingOrders[orderId].PickUpTime);
                     _logger.LogWarning($"Order {returnOrder.OrderId} is ready to be returned back");
+
                     OrderListMutex.WaitOne();
                     //delete order from _orderList
                     _orderList.TryRemove(new KeyValuePair<int, Order>(orderId, _orderList[orderId]));
@@ -179,7 +203,6 @@ namespace Kitchen.Services
                     _preparingOrders.TryRemove(new KeyValuePair<int, ReturnOrder>(orderId, returnOrder));
                 }
             }
-
             PreparingOrdersMutex.ReleaseMutex();
         }
 
@@ -187,21 +210,21 @@ namespace Kitchen.Services
         {
             OrderListMutex.WaitOne();
             _orderList[order.OrderId] = order;
-            _logger.LogWarning($"Order {order.OrderId} has been added to the Order List!");
             OrderListMutex.ReleaseMutex();
+            _logger.LogWarning($"Order {order.OrderId} has been added to the Order List!");
             BreakDownOrderToFoodList(order); 
         }
 
         public void BreakDownOrderToFoodList(Order order)
         {
-            PreparingOrdersMutex.WaitOne();
             //add order to dictionary of preparing orders
+            PreparingOrdersMutex.WaitOne();
             _preparingOrders[order.OrderId] = new ReturnOrder(order, 1, new List<CookingDetails>());
+            PreparingOrdersMutex.ReleaseMutex();
             _logger.LogWarning($"Order {order.OrderId} has been added to the preparing orders");
             var foodList = order.Items;
-            PreparingOrdersMutex.ReleaseMutex();
 
-            _foodListSemaphore.Wait();
+            _foodListSemaphore.Wait(); //semaphore for enqueueing and dequeueing
             //add foods in the priority dictionary
             foreach (var foodId in foodList)
             {
@@ -220,8 +243,6 @@ namespace Kitchen.Services
                     default:
                         //add in foodList based on complexity food and its order id
                         _foodList[food.Complexity].Enqueue((order.OrderId, food));
-                        //_logger.LogWarning($"Food {food.Id} of order {order.OrderId} " +
-                        //    $"has been added to the foodList");
                         break;
                 }
 
