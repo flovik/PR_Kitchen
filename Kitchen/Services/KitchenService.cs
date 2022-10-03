@@ -20,8 +20,6 @@ namespace Kitchen.Services
         private static readonly Mutex PreparingOrdersMutex = new();
         private readonly IKitchenSender _kitchenSender;
         private readonly SemaphoreSlim _foodListSemaphore;
-        //private readonly SemaphoreSlim _stovesSemaphore;
-        //private readonly SemaphoreSlim _ovensSemaphore;
         public int TimeUnit { get; }
 
         public KitchenService(IConfiguration configuration, ILogger<KitchenService> logger, IKitchenSender kitchenSender, ILogger<Cook> cookLogger, ILogger<Stove> stoveLogger, ILogger<Oven> ovenLogger)
@@ -65,19 +63,23 @@ namespace Kitchen.Services
 
             for (int i = 0; i < stoves; i++)
             {
-                var stove = new Stove(TimeUnit);
-                stove.PreparingOrdersMutex = PreparingOrdersMutex;
-                stove.PreparingOrders = _preparingOrders;
-                stove._logger = stoveLogger;
+                var stove = new Stove(i + 1, TimeUnit)
+                {
+                    PreparingOrdersMutex = PreparingOrdersMutex,
+                    PreparingOrders = _preparingOrders,
+                    _logger = stoveLogger
+                };
                 _stoves.Add(stove);
             }
 
             for (int i = 0; i < ovens; i++)
             {
-                var oven = new Oven(TimeUnit);
-                oven.PreparingOrdersMutex = PreparingOrdersMutex;
-                oven.PreparingOrders = _preparingOrders;
-                oven._logger = ovenLogger;
+                var oven = new Oven(i + 1, TimeUnit)
+                {
+                    PreparingOrdersMutex = PreparingOrdersMutex,
+                    PreparingOrders = _preparingOrders,
+                    _logger = ovenLogger
+                };
                 _ovens.Add(oven);
             }
 
@@ -98,9 +100,50 @@ namespace Kitchen.Services
                 //cooking apparatus will execute here, because it is not considered food that occupies a whole thread
                 //a specific waiter can take the food and put in the stove
 
-                //run new task here
-                //CheckApparatusFood(cook, 4); //for stoves
-                //CheckApparatusFood(cook, 5); //for ovens
+                foreach (var cook in _cooks)
+                {
+                    if (!_foodList[4].IsEmpty) //stoves
+                    {
+                        _foodList[4].TryPeek(out var food);
+                        if (!cook.CanCook(food.Item2.Complexity)) continue;
+
+                        foreach (var stove in _stoves)
+                        {
+                            if (stove.State == ApparatusState.Free)
+                            {
+                                await _foodListSemaphore.WaitAsync(); // wait 
+                                //remove food from foodList
+                                _foodList[4].TryDequeue(out var cookFood);
+                                _foodListSemaphore.Release();
+
+                                stove.State = ApparatusState.Occupied;
+                                await cook.UseStove(stove, cookFood);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!_foodList[5].IsEmpty) //ovens
+                    {
+                        _foodList[5].TryPeek(out var food);
+                        if (!cook.CanCook(food.Item2.Complexity)) continue;
+
+                        foreach (var oven in _ovens)
+                        {
+                            if (oven.State == ApparatusState.Free)
+                            {
+                                await _foodListSemaphore.WaitAsync(); // wait 
+                                //remove food from foodList
+                                _foodList[5].TryDequeue(out var cookFood);
+                                _foodListSemaphore.Release();
+
+                                oven.State = ApparatusState.Occupied;
+                                await cook.UseOven(oven, cookFood);
+                                break;
+                            }
+                        }
+                    }
+                }
 
                 //iterate every foodQueue (from 1 to 3) the cook can cook from highest to lowest
                 for (int complexity = 3; complexity >= 1; complexity--)
@@ -131,38 +174,6 @@ namespace Kitchen.Services
                 CheckIfReady();
             }
         }
-
-        //public void CheckApparatusFood(Cook cook, int row)
-        //{
-        //    _foodListSemaphore.Wait();
-        //    if (!_foodList[row].IsEmpty) //no cooking apparatus foods
-        //    {
-        //        var isFood = _foodList[row].TryDequeue(out var food);
-        //        if (isFood && cook.Rank >= food.Item2.Complexity) //check if could get stove food and that current cook's complexity is enough
-        //        {
-        //            switch (row)
-        //            {
-        //                case 4:
-        //                    _stovesSemaphore.Wait();
-        //                    _logger.LogCritical($"A stove is used! Remaining: {_stovesSemaphore.CurrentCount}");
-        //                    Task.Run(() => PrepareFood(cook, food)).Wait(); //new thread for preparing food in stove, wait for it when done
-        //                    //then release it for another food to be cooked
-        //                    _stovesSemaphore.Release();
-        //                    _logger.LogCritical($"A stove is released! Remaining: {_stovesSemaphore.CurrentCount}");
-        //                    break;
-        //                case 5:
-        //                    _ovensSemaphore.Wait();
-        //                    _logger.LogCritical($"An oven is used! Remaining: {_ovensSemaphore.CurrentCount}");
-        //                    Task.Run(() => PrepareFood(cook, food)).Wait();
-        //                    _ovensSemaphore.Release();
-        //                    _logger.LogCritical($"An oven is released! Remaining: {_ovensSemaphore.CurrentCount}");
-        //                    break;
-        //            }
-                    
-        //        }
-        //    }
-        //    _foodListSemaphore.Release();
-        //}
 
         public void CheckIfReady()
         {

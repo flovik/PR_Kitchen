@@ -70,6 +70,18 @@ namespace Kitchen.Services
             Proficiency++;
         }
 
+        public Task UseStove(Stove stove, (int, Food) food)
+        {
+            Task.Run(() => stove.Prep(CookId, food));
+            return Task.CompletedTask;
+        }
+
+        public Task UseOven(Oven oven, (int, Food) food)
+        {
+            Task.Run(() => oven.Prep(CookId, food));
+            return Task.CompletedTask;
+        }
+
         public bool CanCook(int complexity)
         {
             if (Rank < complexity || Proficiency == 0) return false;
